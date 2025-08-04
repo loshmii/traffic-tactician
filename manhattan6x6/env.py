@@ -43,6 +43,7 @@ class Manhattan6x6Env(AbstractEnv):
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(64,), dtype=np.float32
         )
+        self.viewer = None
         self.np_random, _ = seeding.np_random()
         self.reset()
 

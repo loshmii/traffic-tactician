@@ -1,0 +1,16 @@
+#Ignore under .vscode
+.vscode/
+
+# Ignore Python cache files
+.pytest_cache/
+__pycache__/
+manhattan6x6/__pycache__/
+
+# Ignore policies
+policies/
+
+#Ignore tests
+tests/
+
+#Ignore dependency files
+traffic_tactician.egg-info/
