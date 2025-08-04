@@ -1,47 +1,37 @@
-import sys, os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-import numpy as np
-import networkx as nx
+import os, sys, numpy as np
 
-from manhattan6x6.env import Manhattan6x6Env
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from manhattan6x6 import Manhattan6x6Env
+
 
 def test_reset():
-    env = Manhattan6x6Env()
-    obs, _ = env.reset()
-    assert obs.shape == (64,)
+    obs, _ = Manhattan6x6Env().reset(seed=0)
+    assert obs.shape == (19,) and obs.dtype == np.float32
+
 
 def test_step():
     env = Manhattan6x6Env()
-    obs, _ = env.reset()
-    obs, rew, term, trunc, info = env.step(env.action_space.sample())
-    assert isinstance(obs, np.ndarray)
-    assert isinstance(rew, float)
-    assert isinstance(term, bool)
-    assert isinstance(trunc, bool)
-    assert isinstance(info, dict)
+    obs, _ = env.reset(seed=0)
+    obs, r, term, trunc, _ = env.step(0)
+    assert obs.shape == (19,) and np.isfinite(r)
+    assert isinstance(term, (bool, np.bool_)) and isinstance(trunc, (bool, np.bool_))
 
-def shortest_path_driver(env: Manhattan6x6Env):
-    path = nx.shortest_path(env.graph, source=env.start, target=env.goal)
-    headings = [(1, 0), (0, 1), (-1, 0), (0, -1)]
-    total_reward = 0.0
-    obs, _ = env.reset(seed=42)
-    for target in path[1:]:
-        diff = (target[0] - env.position[0], target[1] - env.position[1])
-        desired = headings.index(diff)
-        if desired == env.heading:
-            action = 0
-        elif (desired - env.heading) % 4 == 1:
-            action = 3
-        else:
-            action = 4
-        obs, rew, term, trunc, _ = env.step(action)
-        total_reward += rew
-        if term or trunc:
-            break
-    return total_reward, term, trunc
 
-def test_solve():
+def test_reward():
     env = Manhattan6x6Env()
-    total_reward, term, trunc = shortest_path_driver(env)
-    assert term and not trunc
-    assert total_reward >= 50
+    env.reset(seed=0)
+    env._last_acc = -100  # induce big jerk
+    _, r, _, _, _ = env.step(0)
+    assert r < -1.0
+
+
+def test_goal():
+    env = Manhattan6x6Env(config={"spawn_vehicles": 0})
+    obs, _ = env.reset(seed=0)
+    tot, step, done, trunc = 0.0, 0, False, False
+    while not (done or trunc) and step < 2000:
+        act = 1 if step < 20 else 0  # accelerate then cruise
+        obs, r, done, trunc, _ = env.step(act)
+        tot += r
+        step += 1
+    assert done and tot >= 80

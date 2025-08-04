@@ -14,3 +14,6 @@ tests/
 
 #Ignore dependency files
 traffic_tactician.egg-info/
+
+#Ignore runs
+runs/
