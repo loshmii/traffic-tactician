@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 
 import manhattan6x6  # ensure the package is imported for registration
 from scripts.make_gif import make_gif  # absolute import
@@ -80,10 +80,25 @@ def main():
     # 1) Training env (no rendering)
     train_env_fn = lambda: gym.make(GYM_ENV_ID)
     train_env = DummyVecEnv([train_env_fn])
+    train_env = VecMonitor(train_env)
 
-    model = PPO("MlpPolicy", train_env,
-                policy_kwargs=dict(net_arch=[128, 128]),
-                verbose=0)
+    model = PPO("MlpPolicy",
+                train_env,
+                learning_rate=3e-4,
+                gamma=0.995,
+                clip_range=0.2,
+                policy_kwargs=dict(net_arch=[256, 256]),
+                verbose=0,
+                tensorboard_log="logs/ppo_manhattan6x6",
+    )
+    
+    phases = [
+        (1_000_000, dict(spawn_vehicles=0, shaping_coef=1.0, step_cost=0.0)),
+        (0, dict(shaping_coef=1.0, step_cost=0.05)),
+        (0, dict(spawn_vehicles=5, shaping_coef=0.5)),
+        (0, dict(spawn_vehicles=20, shaping_coef=0.2)),
+        (0, dict(shaping_coef=0.0)),
+    ]
 
     runs = Path("runs")
     runs.mkdir(exist_ok=True)
@@ -101,7 +116,19 @@ def main():
 
     # 3) Train
     cb = RewardLogger(args.episodes, runs / "reward_log.csv", not args.no_tqdm)
-    model.learn(int(1e9), callback=cb, progress_bar=False)
+    
+    total = 0
+    for idx, (steps, kwargs) in enumerate(phases, 1):
+        train_env.env_method("set_curriculum", **kwargs)
+        model.learn(
+            steps,
+            callback=cb,
+            tb_log_name=f"stage{idx}",
+            progress_bar=False,
+            reset_num_timesteps=False,
+        )
+        total += steps
+        print(f"phase done - accumulated steps: {total}")
 
     # 4) After-GIF
     if not args.no_gif:

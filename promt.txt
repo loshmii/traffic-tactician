@@ -1,0 +1,114 @@
+To give your agent *full* low-level control—no built-in route planner or steering controller mucking about—you need to:
+
+1. **Swap out the rule-based MDPVehicle for a “fully controlled” vehicle class**,
+2. **Replace the DiscreteMetaAction wrapper with either a continuous or “primitive” discrete action space** that directly maps to steering & throttle,
+3. **Remove the call to the internal route‐planner (`plan_route_to`)** so there’s no hidden goal-tracking logic.
+
+---
+
+### 1. Use `ControlledVehicle` instead of `MDPVehicle`
+
+In your `_create_vehicles`, change:
+
+```python
+from highway_env.vehicle.controller import MDPVehicle
+# …
+ego = MDPVehicle.make_on_lane(self.road, ego_start, longitudinal=5, speed=5)
+ego.plan_route_to((g - 1, g))
+```
+
+to something like:
+
+```python
+from highway_env.vehicle.controller import ControlledVehicle
+
+# Spawn a vehicle with no route planner attached:
+ego = ControlledVehicle.make_on_lane(self.road, ego_start, speed=0.0)
+# don’t call plan_route_to(...)
+```
+
+`ControlledVehicle` expects *all* control inputs (steering & acceleration) from your policy, and won’t internally decide how to turn at intersections.
+
+---
+
+### 2. Give the agent primitive control actions
+
+Rather than `DiscreteMetaAction` (which wraps “LANE\_LEFT”/“LANE\_RIGHT” into a lane-change macro), switch to either:
+
+* **Continuous steering + acceleration**
+
+  ```python
+  from highway_env.envs.common.action import ContinuousAction
+  # in define_spaces():
+  self.action_type       = ContinuousAction(self)
+  self.action_space, _   = self.action_type.space(), self.observation_space
+  ```
+
+  This yields a Box of shape `(2,)`: `[steering, acceleration] ∈ [-1,1]^2`, so your network must learn *both* how hard to turn and how much gas/brake to apply.
+
+* **Primitive discrete**
+  If you really want a small discrete set, you could subclass `DiscreteAction` (instead of `DiscreteMetaAction`) and map e.g.
+
+  ```
+  0 → hard left turn
+  1 → slight left
+  2 → straight
+  3 → slight right
+  4 → hard right
+  5 → accelerate
+  6 → brake
+  ```
+
+  but the key is: *never* call `plan_route_to`, and have your `env._step(action)` push that action straight into the vehicle’s `act()` as raw steering/throttle.
+
+---
+
+### 3. Remove the internal route planner
+
+Because with `MDPVehicle` you do:
+
+```python
+ego.plan_route_to((g-1, g))
+```
+
+and the base‐class controller automatically computes a shortest‐path and then juggles steering & lane‐changes for you.  Once you switch to `ControlledVehicle` *and* use a low‐level action space, simply omit that line, and your policy is the *only* source of direction.
+
+---
+
+#### Putting it all together
+
+```python
+from highway_env.vehicle.controller import ControlledVehicle
+from highway_env.envs.common.action import ContinuousAction
+
+class Manhattan6x6Env(AbstractEnv):
+    # …
+    def define_spaces(self):
+        self.action_type       = ContinuousAction(self)
+        self.action_space, _   = self.action_type.space(), self.observation_space
+
+    def _create_vehicles(self, cfg):
+        # Ego
+        ego_start = ((-1,0),(0,0),0)
+        ego = ControlledVehicle.make_on_lane(self.road, ego_start, speed=0.0)
+        # no plan_route_to()
+        self.vehicle = ego
+        self.road.vehicles.append(ego)
+
+        # background vehicles can stay as IDMVehicle…
+```
+
+Now your PPO will have to literally learn:
+– how much steering angle (or wheel torque) to apply
+– when & how hard to throttle or brake
+– *and* how to navigate the grid, since there’s no hidden planner taking care of lane‐changes for you.
+
+---
+
+#### Why this works
+
+* **`ControlledVehicle`** has no built‐in route planner or lane‐tracking PID.
+* **`ContinuousAction`** (or a truly primitive discrete wrapper) hands you raw `(steering, accel)` control.
+* **No `plan_route_to()`** means *every* turn decision lives in your network.
+
+Give that a try and you’ll see: the very first episode will start with a *random* meander, not a straight shot NE!
