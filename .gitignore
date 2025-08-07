@@ -17,3 +17,6 @@ traffic_tactician.egg-info/
 
 #Ignore runs
 runs/
+
+#Ignore logs
+logs/

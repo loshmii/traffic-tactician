@@ -1,8 +1,9 @@
-"""Generate an animated GIF rollout of a Manhattan grid‑driving environment.
+#!/usr/bin/env python3
+"""
+Generate an animated GIF rollout of a Manhattan grid‑driving environment.
 
-The script creates the env via ``gym.make`` with ``render_mode='rgb_array'``,
-then steps either a random policy or a supplied Stable‑Baselines3 PPO model for
-``--steps`` timesteps and writes the rendered frames to a GIF.
+The script uses Gymnasium with `render_mode='rgb_array'` to capture frames
+and writes them directly to a GIF file via ImageIO, without displaying any window.
 
 Usage example
 -------------
@@ -10,15 +11,10 @@ $ python scripts/make_gif.py --output runs/before.gif --steps 2000 \
       --env-id Manhattan6x6-v0 --seed 42 --no-traffic
 """
 
-from __future__ import annotations
-
 import argparse
 from pathlib import Path
-
 import gymnasium as gym
-import imageio.v2 as imageio
-import numpy as np
-import manhattan6x6  # noqa: F401 – registers the envs via import side‑effects
+import imageio
 
 
 def make_gif(
@@ -26,113 +22,77 @@ def make_gif(
     model,
     output_path: Path,
     env_config: dict | None = None,
-    steps: int = 2_000,
+    steps: int = 2000,
     fps: int = 15,
     seed: int | None = None,
 ) -> None:
-    """Roll out *model* (or a random policy) in *env_id* and save a GIF.*"""
+    """Roll out *model* (or a random policy) in *env_id* and save a GIF."""
 
-    # ------------------------------------------------------------------
-    # Environment -------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Highway‑Env expects custom parameters to be passed under the ``config``
-    # kwarg, *not* as arbitrary kwargs.  We therefore forward ``env_config``
-    # this way so callers can tweak things like the number of background cars
-    # (e.g. ``{"spawn_vehicles": 0}``).
+    # Create environment with array-based rendering
     env = gym.make(env_id, render_mode="rgb_array", config=env_config or {})
-
-    # Seed *after* creation so that the RNGs inside Highway‑Env pick it up.
     obs, _ = env.reset(seed=seed)
 
-    # ------------------------------------------------------------------
-    # GIF writer --------------------------------------------------------
-    # ------------------------------------------------------------------
+    # Prepare output
     output_path.parent.mkdir(parents=True, exist_ok=True)
     duration = 1 / fps
-    with imageio.get_writer(output_path, mode="I", duration=duration) as writer:
-        terminated = truncated = False
-        for _ in range(steps):
-            # Choose an action ------------------------------------------------
-            if model is None:
-                action = env.action_space.sample()
-            else:
-                action, _ = model.predict(obs, deterministic=True)
+    writer = imageio.get_writer(output_path, mode="I", duration=duration)
 
-            # Environment step ----------------------------------------------
-            obs, _, terminated, truncated, _ = env.step(action)
-            frame = env.render()
-            writer.append_data(np.asarray(frame))
+    # Rollout loop
+    terminated = truncated = False
+    for _ in range(steps):
+        # Select action
+        if model is None:
+            action = env.action_space.sample()
+        else:
+            action, _ = model.predict(obs, deterministic=True)
 
-            if terminated or truncated:
-                break
+        # Step environment
+        obs, _, terminated, truncated, _ = env.step(action)
+        frame = env.render()  # RGB array, no window shown
+        writer.append_data(frame)
 
+        if terminated or truncated:
+            break
+
+    # Cleanup
+    writer.close()
     env.close()
 
-
-# --------------------------------------------------------------------------- #
-# CLI                                                                         #
-# --------------------------------------------------------------------------- #
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Create an animated GIF rollout of a Manhattan grid traffic env.",
     )
-    p.add_argument(
-        "--env-id",
-        type=str,
-        default="Manhattan6x6-v0",
-        help="Gymnasium ID of the registered environment.",
-    )
-    p.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="Where to save the resulting GIF.",
-    )
-    p.add_argument(
-        "--policy",
-        type=Path,
-        help="Path to a saved Stable‑Baselines3 PPO model (.zip). If omitted, a random policy is used.",
-    )
-    p.add_argument(
-        "--steps",
-        type=int,
-        default=2_000,
-        help="Maximum number of environment steps to record.",
-    )
-    p.add_argument(
-        "--fps",
-        type=int,
-        default=15,
-        help="Playback frames per second for the resulting GIF.",
-    )
-    p.add_argument("--seed", type=int, help="Optional RNG seed for reproducibility.")
-
-    # Convenience flag: completely disable background traffic
-    p.add_argument(
-        "--no-traffic",
-        action="store_true",
-        help="Spawn the environment with zero background vehicles.",
-    )
+    p.add_argument("--env-id", type=str, default="Manhattan6x6-v0",
+                   help="Gymnasium ID of the registered environment.")
+    p.add_argument("--output", type=Path, required=True,
+                   help="Where to save the resulting GIF.")
+    p.add_argument("--policy", type=Path,
+                   help="Path to a saved SB3 PPO model (.zip). If omitted, uses a random policy.")
+    p.add_argument("--steps", type=int, default=2000,
+                   help="Max number of environment steps to record.")
+    p.add_argument("--fps", type=int, default=15,
+                   help="Playback frames per second for the GIF.")
+    p.add_argument("--seed", type=int,
+                   help="Optional RNG seed for reproducibility.")
+    p.add_argument("--no-traffic", action="store_true",
+                   help="Spawn zero background vehicles.")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
-    # Optionally load SB3 model -------------------------------------------
+    # Load SB3 model if provided
     model = None
     if args.policy:
         from stable_baselines3 import PPO
-
         model = PPO.load(str(args.policy))
 
-    # Compose env config ---------------------------------------------------
-    env_cfg = {}
-    if args.no_traffic:
-        env_cfg["spawn_vehicles"] = 0
+    # Configure environment
+    env_cfg = {"spawn_vehicles": 0} if args.no_traffic else {}
 
-    # Generate the GIF -----------------------------------------------------
+    # Create GIF
     make_gif(
         env_id=args.env_id,
         model=model,

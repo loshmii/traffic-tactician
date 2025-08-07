@@ -4,6 +4,7 @@ import argparse
 import csv
 import sys
 from pathlib import Path
+from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -13,7 +14,7 @@ import matplotlib.pyplot as plt
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 
 import manhattan6x6  # registers the envs
@@ -72,6 +73,62 @@ class RewardLogger(BaseCallback):
             self.pbar.close()
         self._f.close()
 
+class EMAPlottingCallback(BaseCallback):
+    def __init__(self, span: int = 100, verbose: int = 0):
+        super().__init__(verbose)
+        self.span = span
+        self.alpha = 2 / (span + 1)  # EMA smoothing factor
+        self.ema = {}
+        self.last_values = deque()
+        self.step_count = 0
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        dones = self.locals.get("dones", [])
+        for done, info in zip(dones, infos):
+            if not done or "episode" not in info:
+                continue
+            ep = info["episode"]
+
+            if not self.ema:
+                for k,v in ep.items():
+                    if k in ("l", "r"):
+                        continue
+                    self.ema[k] = v
+            for k, v in ep.items():
+                if k in ("l", "r"):
+                    continue
+                self.ema[k] = self.alpha * float(v) + (1 - self.alpha) * self.ema[k]
+                self.logger.record(f"ema/{k}", self.ema[k])
+            self.logger.record("rollout/ep_rew_mean", ep.get("total_reward", 0.0))
+            self.logger.record("rollout/ep_len_mean", ep.get("l", 0.0))
+
+            self.step_count += 1
+            self.logger.record("train/episode", self.step_count)
+    
+        return True
+
+class EarlySuccessStop(BaseCallback):
+    """Stop training after successive goal-reaching episodes."""
+
+    def __init__(self, patience: int = 50, verbose: int = 0):
+        super().__init__(verbose)
+        self.patience = patience
+        self._streak = 0
+
+    def _on_step(self):
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            if info.get("goal", 0.0) > 0.0:
+                self._streak += 1
+            else:
+                self._streak = 0
+        if self._streak >= self.patience:
+            if self.verbose:
+                print(f"Stopping early after {self._streak} consecutive goal-reaching episodes.")
+            return False
+        return True
+
 
 class StopOnEpisodes(BaseCallback):
     """Stop training after a fixed number of episodes."""
@@ -87,26 +144,35 @@ class StopOnEpisodes(BaseCallback):
                 return False
         return True
 
-def stats_from_csv(csv_path : Path) :
+def stats_from_csv(csv_path: Path, span: int = 100):
+    """Compute and display EMAs of each reward component at the last episode."""
     df = pd.read_csv(csv_path)
-    df = df.drop(columns="episode")
-    means = df.mean()
-    stds = df.std()
-    print(f"Statistics from {csv_path}:")
+    df = df.drop(columns="episode", errors="ignore")
+    #new: compute EMA for each column
+    ema = df.ewm(span=span, adjust=False).mean()
+    #new: get last EMA values
+    last_ema = ema.iloc[-1]
+    print(f"Exponential Moving Averages (span={span}) at final episode from {csv_path}:")
     for col in df.columns:
-        print(f"{col:20s} mean = {means[col]:8.3f} std = {stds[col]:8.3f}")
+        print(f"{col:20s} EMA = {last_ema[col]:8.3f}")
 
-def plot_csv(csv_path: Path, png_path: Path) -> None:
+
+def plot_csv(csv_path: Path, png_path: Path, span: int = 100) -> None:
+    """Plot EMAs of all reward components over episodes and save to PNG."""
     df = pd.read_csv(csv_path)
-    ax = df.plot(
-        x = "episode",
-        y = "total_reward",
-        figsize=(8,4),
+    #new: compute EMA series and include episode index
+    df_ema = df.set_index("episode").ewm(span=span, adjust=False).mean().reset_index()
+    #new: plot EMA of each component
+    ax = df_ema.plot(
+        x="episode",
+        y=[col for col in df_ema.columns if col not in ["episode", "l", "r", "t"]],
+        figsize=(10, 6),
         grid=True,
-        title="Episode Rewards",
+        title=f"EMA (span={span}) of Reward Components",
     )
     ax.set_xlabel("Episode")
-    ax.set_ylabel("Total Reward")
+    ax.set_ylabel("EMA value")
+    # save figure
     png_path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(png_path, dpi=300)
@@ -153,7 +219,7 @@ def main() -> None:
     runs.mkdir(exist_ok=True)
 
     # Generate "before training" GIF using first phase
-    if not args.no_gif:
+    """if not args.no_gif:
         make_gif(
             env_id=GYM_ENV_ID,
             model=None,
@@ -162,31 +228,43 @@ def main() -> None:
             steps=args.steps,
             fps=args.fps,
             seed=args.seed,
-        )
+        )"""
 
     def make_env() -> gym.Env:
         return gym.make(GYM_ENV_ID)
 
-    train_env = DummyVecEnv([make_env])
+    raw_env = DummyVecEnv([make_env])
+    train_env = VecNormalize(
+        raw_env,
+        norm_obs=True,
+        norm_reward=True,
+        clip_obs=10.0,
+    )
     train_env = VecMonitor(
         train_env,
         filename=str(runs / "monitor.csv"),
-        info_keywords=("total_reward", "progress", "lane_centering", "off_road", "steering_smoothness",
-            "heading_alignment", "ttc", "step_cost", "jerk"
-            , "crash", "goal"),
+        info_keywords=("total_reward", "shape", "ttc", "step_cost", "jerk",
+            "crash", "goal", "off_road_hard_event", "off_road_soft_penalty"),
     )
 
     model = PPO(
         "MlpPolicy", train_env,
-        learning_rate=3e-4,
-        gamma=0.995,
+        learning_rate=2.5e-4,
+        n_steps=4096,
+        batch_size=4096,
+        gamma=0.99,
+        gae_lambda=0.95,
+        ent_coef=0.01,
+        vf_coef=0.5,
         clip_range=0.2,
         policy_kwargs=dict(net_arch=[256, 256]),
-        verbose=0,
+        verbose=1,
         tensorboard_log="logs/ppo_manhattan2x2"
     )
 
     cb_logger = RewardLogger(total_episodes, runs / "reward_log.csv", not args.no_tqdm)
+    cb_ema = EMAPlottingCallback(span=100, verbose=1)
+    early_stop = EarlySuccessStop(patience=50, verbose=1)
     completed = 0
     last_cfg: dict | None = None
 
@@ -197,10 +275,12 @@ def main() -> None:
             print(f"--- Skipping phase {idx}: zero episodes requested ---")
             continue
         # Apply curriculum and record last config
+        if (idx != 1) :
+            model.load(runs / "model" / f"ppo_phase_{idx-1}")
         train_env.env_method("set_curriculum", **cfg)
         last_cfg = cfg
         stop_cb = StopOnEpisodes(eps)
-        callbacks = CallbackList([cb_logger, stop_cb])
+        callbacks = CallbackList([cb_logger, stop_cb, early_stop, cb_ema])
         model.learn(
             total_timesteps=int(1e9),
             callback=callbacks,
@@ -209,6 +289,9 @@ def main() -> None:
         )
         completed += eps
         print(f"--- Phase {idx} done: total episodes completed = {completed} ---")
+        model.save(runs / "model" / f"ppo_phase_{idx}")
+        train_env.save(runs / "env" / f"train_env_phase_{idx}")
+    
 
     # Generate "after training" GIF using last applied config
     if not args.no_gif:
