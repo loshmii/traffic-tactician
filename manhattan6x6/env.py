@@ -86,8 +86,8 @@ class GridObservation(ObservationType):
 
     N_RAYS, MAX_RANGE = 16, 100.0  # lidar spec
 
-    def space(self) -> spaces.Space:  # 3 kin + 3 goal + 16 lidar = 22
-        return spaces.Box(-np.inf, np.inf, (6 + self.N_RAYS,), np.float32)
+    def space(self) -> spaces.Space:  # 3 kin + 3 goal + 1 ttc + 16 lidar = 22
+        return spaces.Box(-np.inf, np.inf, (7 + self.N_RAYS,), np.float32)
 
     def observe(self):
         v = self.observer_vehicle
@@ -118,8 +118,11 @@ class GridObservation(ObservationType):
                 ang = (np.arctan2(rel[1], rel[0]) - v.heading) % (2 * np.pi)
                 idx = int(ang / (2 * np.pi / self.N_RAYS))
                 dists[idx] = min(dists[idx], d)
+        # ttc -------------------------------------------------------------
+        ttc = self.env._front_ttc()
+        ttc_n = ttc / 10.0
 
-        return np.concatenate(( [speed, acc, jerk], goal_obs, dists / self.MAX_RANGE )).astype(np.float32)
+        return np.concatenate(( [speed, acc, jerk], goal_obs, [ttc_n], dists / self.MAX_RANGE )).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -162,12 +165,16 @@ class _BaseManhattanEnv(AbstractEnv):
             lane_length           = 200.0,
             spawn_vehicles        = 20,
             # reward shaping -----------------------------------------
-            heading_coef          = 0.05,
-            shaping_coef          = 1.0,
-            step_cost             = 0.0,
-            jerk_cost             = 0.01,
+            lane_centering_coef   = 2.0,
+            heading_coef          = 2**5,
+            shaping_coef          = 2**2,
+            step_cost             = -0.01,
+            jerk_cost             = -0.01,
             goal_reward           = 100.0,
             crash_penalty         = -100.0,
+            off_road_penalty      = -50.0,
+            steer_smoothness_coef = -0.01,
+            ttc_penalty_coef      = 5.0,
         )
         return cfg
 
@@ -203,14 +210,38 @@ class _BaseManhattanEnv(AbstractEnv):
         _add_background_traffic(self, cfg["spawn_vehicles"])
 
     # ------------------------------------------------------------------
+    # TTC helpers
+    # ------------------------------------------------------------------
+    def _front_ttc(self, horizon = 10.0) -> float:
+        # closest vehicle in front of the ego, or inf if none
+        front, _ = self.road.neighbour_vehicles(self.vehicle)
+        if front is None:
+            return horizon
+        gap = front.position[0] - self.vehicle.position[0] - front.LENGTH
+        closing = max(self.vehicle.speed - front.speed, 1e-1) # avoid div by zero
+        return np.clip(gap / closing, 0.0, horizon)
+
+    # ------------------------------------------------------------------
     # Reset helpers
     # ------------------------------------------------------------------
     def _reset(self):
         self._create_road(self.config)
         self._create_vehicles(self.config)
-        self._last_speed = self._last_acc = self._last_jerk = 0.0
+        self._last_speed = self._last_acc = self._last_jerk = self._last_steer = 0.0
         self._prev_dist_to_goal = np.linalg.norm(self.vehicle.position - self.goal_position)
-
+        self._ep_stats = {
+            "progress": 0.0,
+            "lane_centering": 0.0,
+            "off_road": 0.0,
+            "steering_smoothness": 0.0,
+            "heading_alignment": 0.0,
+            "ttc": 0.0,
+            "step_cost": 0.0,
+            "jerk": 0.0,
+            "total_reward": 0.0,
+            "crash": 0.0,
+            "goal": 0.0,
+        }
     # ------------------------------------------------------------------
     # RL glue
     # ------------------------------------------------------------------
@@ -218,22 +249,49 @@ class _BaseManhattanEnv(AbstractEnv):
         cfg = self.config
         dist_now  = np.linalg.norm(self.vehicle.position - self.goal_position)
         progress  = self._prev_dist_to_goal - dist_now
-        r = cfg["shaping_coef"] * progress
         self._prev_dist_to_goal = dist_now
+
+        # road centering ------------------------------------------------
+        lane = self.road.network.get_lane(self.vehicle.lane_index)
+        long, lat = lane.local_coordinates(self.vehicle.position)
+        w = lane.width_at(long)
+        lane_r = 1 - 2 * abs(lat / w) ** 2
+
+        # steering smoothness -----------------------------------
+        steer_rate = abs(action[1] - self._last_steer)
+        self._last_steer = action[1]
 
         # heading alignment --------------------------------------------
         vec = self.goal_position - self.vehicle.position
         err = (np.arctan2(vec[1], vec[0]) - self.vehicle.heading + np.pi) % (2 * np.pi) - np.pi
-        r += cfg["heading_coef"] * np.cos(err)
 
-        # costs ---------------------------------------------------------
-        r -= cfg["step_cost"]
-        r -= cfg["jerk_cost"] * abs(self._last_jerk)
-        if self.vehicle.crashed:
-            r += cfg["crash_penalty"]
-        elif self._goal_reached():
-            r += cfg["goal_reward"]
+        # time-to-collision (TTC) ----------------------------------------
+        ttc = self._front_ttc()
+
+        self._rc = {
+            "progress" : cfg["shaping_coef"] * progress,
+            "lane_centering": cfg["lane_centering_coef"] * lane_r,
+            "off_road" : cfg["off_road_penalty"] if abs(lat) > w / 2 else 0.0,
+            "steering_smoothness": cfg["steer_smoothness_coef"] * steer_rate,
+            "heading_alignment": cfg["heading_coef"] * np.cos(err),
+            "ttc" : cfg["ttc_penalty_coef"] * (ttc - 3.0) if ttc < 3.0 else 0.0,
+            "step_cost": cfg["step_cost"],
+            "jerk": cfg["jerk_cost"] * abs(self._last_jerk),
+            "crash": cfg["crash_penalty"] if self.vehicle.crashed else 0.0,
+            "goal": cfg["goal_reward"] if self._goal_reached() else 0.0,
+        }
+
+        for k, v in self._rc.items():
+            self._ep_stats[k] += v
+
+        r = sum(self._rc.values())
+        self._ep_stats["total_reward"] += r
         return float(r)
+    
+    def _info(self, obs, action):
+        if self._is_terminated() or self._is_truncated():
+            return self._ep_stats.copy()
+        return {}
 
     def _goal_reached(self) -> bool:
         return np.linalg.norm(self.vehicle.position - self.goal_position) < 5.0
@@ -243,9 +301,6 @@ class _BaseManhattanEnv(AbstractEnv):
 
     def _is_truncated(self):
         return self.steps >= self.config["duration"]
-
-    def _info(self, obs, action):
-        return {}
 
     # curriculum -----------------------------------------------------------
     def set_curriculum(self, **kwargs):

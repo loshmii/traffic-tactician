@@ -2,6 +2,7 @@ import os, sys, numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from manhattan6x6 import Manhattan6x6Env
+from highway_env.envs import HighwayEnvFast
 
 
 def test_reset():

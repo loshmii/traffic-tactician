@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  # headless backend
 import matplotlib.pyplot as plt
@@ -13,6 +14,7 @@ import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+from stable_baselines3.common.monitor import Monitor
 
 import manhattan6x6  # registers the envs
 from scripts.make_gif import make_gif
@@ -27,39 +29,48 @@ class RewardLogger(BaseCallback):
         self.total_episodes = total_episodes
         self.csv_path = csv_path
         self.use_tqdm = use_tqdm
-        self.episodes_logged = 0
-        self.episode_return = 0.0
-        self.pbar = None
+        self.comp_keys = None
         self._header_written = False
+        
+    def _open(self) :
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "w" if not self._header_written else "a"
+        self._f = self.csv_path.open(mode, newline="")
+        self._writer = csv.writer(self._f)   
 
     def _on_training_start(self) -> None:
-        self.csv_path.parent.mkdir(exist_ok=True)
-        mode = "w" if not self._header_written else "a"
-        self.file = self.csv_path.open(mode, newline="")
-        self.writer = csv.writer(self.file)
-        if not self._header_written:
-            self.writer.writerow(["episode", "reward"])
-            self._header_written = True
+        self._open()
         if self.use_tqdm:
             from tqdm import tqdm
-            self.pbar = tqdm(total=self.total_episodes)
-            if self.episodes_logged > 0:
-                self.pbar.update(self.episodes_logged)
+            self.pbar = tqdm(total=self.total_episodes, desc="Episodes")
 
     def _on_step(self) -> bool:
-        self.episode_return += float(self.locals["rewards"][0])
-        if self.locals["dones"][0]:
-            self.writer.writerow([self.episodes_logged, self.episode_return])
-            if self.pbar:
-                self.pbar.update(1)
-            self.episodes_logged += 1
-            self.episode_return = 0.0
-        return self.episodes_logged < self.total_episodes
+        if not self.locals["dones"][0]:
+            return True
+        
+        infos = self.locals["infos"][0]
+        ep_stats = infos["episode"] if "episode" in infos else infos
+
+        if self.comp_keys is None:
+            self.comp_keys = ["total_reward", *sorted(k for k in ep_stats if k != "total_reward")]
+            self._writer.writerow(["episode", *self.comp_keys])
+            self._header_written = True
+        
+        if not hasattr(self, "episode_idx"):
+            self.episode_idx = 0
+        row = [self.episode_idx] + [ep_stats.get(k, 0.0) for k in self.comp_keys]
+        self._writer.writerow(row)
+
+        if self.use_tqdm:
+            self.pbar.update(1)
+        self.episode_idx += 1
+
+        return self.episode_idx < self.total_episodes
 
     def _on_training_end(self) -> None:
-        if self.pbar:
+        if self.use_tqdm:
             self.pbar.close()
-        self.file.close()
+        self._f.close()
 
 
 class StopOnEpisodes(BaseCallback):
@@ -76,16 +87,30 @@ class StopOnEpisodes(BaseCallback):
                 return False
         return True
 
+def stats_from_csv(csv_path : Path) :
+    df = pd.read_csv(csv_path)
+    df = df.drop(columns="episode")
+    means = df.mean()
+    stds = df.std()
+    print(f"Statistics from {csv_path}:")
+    for col in df.columns:
+        print(f"{col:20s} mean = {means[col]:8.3f} std = {stds[col]:8.3f}")
 
 def plot_csv(csv_path: Path, png_path: Path) -> None:
-    episodes, rewards = np.loadtxt(csv_path, delimiter=",", skiprows=1, unpack=True)
-    plt.plot(episodes, rewards)
-    plt.xlabel("Episode")
-    plt.ylabel("Reward")
-    png_path.parent.mkdir(exist_ok=True)
-    plt.savefig(png_path)
+    df = pd.read_csv(csv_path)
+    ax = df.plot(
+        x = "episode",
+        y = "total_reward",
+        figsize=(8,4),
+        grid=True,
+        title="Episode Rewards",
+    )
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Total Reward")
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=300)
     plt.close()
-
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -111,7 +136,7 @@ def main() -> None:
 
     # Define curriculum phases with config updates
     phases: list[dict] = [
-        {"spawn_vehicles": 0,  "shaping_coef": 1.0, "step_cost": 0.0},
+        {"spawn_vehicles": 0,},
         {"shaping_coef": 1.0, "step_cost": 0.05},
         {"spawn_vehicles": 5,  "shaping_coef": 0.5},
         {"spawn_vehicles": 20, "shaping_coef": 0.2},
@@ -143,7 +168,13 @@ def main() -> None:
         return gym.make(GYM_ENV_ID)
 
     train_env = DummyVecEnv([make_env])
-    train_env = VecMonitor(train_env)
+    train_env = VecMonitor(
+        train_env,
+        filename=str(runs / "monitor.csv"),
+        info_keywords=("total_reward", "progress", "lane_centering", "off_road", "steering_smoothness",
+            "heading_alignment", "ttc", "step_cost", "jerk"
+            , "crash", "goal"),
+    )
 
     model = PPO(
         "MlpPolicy", train_env,
@@ -192,6 +223,7 @@ def main() -> None:
         )
 
     plot_csv(runs / "reward_log.csv", runs / "reward_curve.png")
+    stats_from_csv(runs / "reward_log.csv")
     sys.exit(0)
 
 
