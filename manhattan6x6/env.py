@@ -134,7 +134,8 @@ class GridObservation(ObservationType):
         ])
 
         # Lane-offset
-        lane         = self.env.road.network.get_lane(self.env.vehicle.lane_index)
+        lane_idx, _ = self.env._closest_lane_index()
+        lane = self.env.road.network.get_lane(lane_idx)
         long, lat    = lane.local_coordinates(v.position)
         w            = lane.width_at(long)
         off_centre   = np.clip(lat / (w / 2), -1.0, 1.0)
@@ -213,12 +214,12 @@ class _BaseManhattanEnv(AbstractEnv):
             alpha=1.0/200.0,  #new
             beta=1.0,         #new
             gamma=1.0,        #new
-            step_cost=0.0,
+            step_cost=-0.02,
             jerk_cost=0.0,
             goal_reward=100.0,
             crash_penalty=-100.0,
             off_road_penalty=-50.0,
-            soft_offroad_margin=-0.5,
+            soft_offroad_margin=-2.0,
             soft_offroad_step=-0.1,
             steer_smoothness_coef=0.0,
             ttc_penalty_coef=5.0,
@@ -247,11 +248,18 @@ class _BaseManhattanEnv(AbstractEnv):
 
         _add_background_traffic(self, cfg["spawn_vehicles"])
 
+    def _closest_lane_index(self, position=None, heading=None):
+        pos = self.vehicle.position if position is None else position
+        idx = self.road.network.get_closest_lane_index(pos, heading)
+        edge_d = self.road.network.get_lane(idx).edge_distance(pos)
+        return idx, float(edge_d)
+
     def _front_ttc(self, horizon: float = 10.0) -> float:
         front, _ = self.road.neighbour_vehicles(self.vehicle)
         if front is None:
             return horizon
-        lane = self.road.network.get_lane(self.vehicle.lane_index)
+        lane_idx, _ = self._closest_lane_index()
+        lane = self.road.network.get_lane(lane_idx)
         ego_s, _ = lane.local_coordinates(self.vehicle.position)
         front_s, _ = lane.local_coordinates(front.position)
         gap = front_s - ego_s - front.LENGTH
@@ -262,12 +270,12 @@ class _BaseManhattanEnv(AbstractEnv):
 
     def _next_waypoint(self, lookahead: float = 20.0) -> np.ndarray:
         """Position of a look-ahead point 20 m ahead (in next lane if upcoming exit)."""
-        lane = self.road.network.get_lane(self.vehicle.lane_index)
+        lane_idx, _ = self._closest_lane_index()
+        lane = self.road.network.get_lane(lane_idx)
         long, _ = lane.local_coordinates(self.vehicle.position)
         if long < lane.length - lookahead - 5.0:
             return lane.position(long + lookahead, 0)
-        curr_idx = self.vehicle.lane_index
-        candidates = self.road.network.outgoing_lanes(curr_idx)
+        candidates = self.road.network.outgoing_lanes(lane_idx)
         best = min(
             candidates,
             key=lambda idx: self._network_distance_to_goal(
@@ -292,11 +300,10 @@ class _BaseManhattanEnv(AbstractEnv):
         """
 
         cfg = self.config
-        lane = self.road.network.get_lane(self.vehicle.lane_index)
-        edge_d = lane.edge_distance(self.vehicle.position)
+        lane_idx, edge_d = self._closest_lane_index()
+        self.vehicle.lane_index = lane_idx  # update lane index in the vehicle
 
         on_lane = edge_d >= 0.0
-
         if on_lane:
             self.off_road_hard = self.off_road_soft = False
             return 0.0
@@ -314,7 +321,9 @@ class _BaseManhattanEnv(AbstractEnv):
         self.off_road_hard = self.off_road_soft = False
         # initialize potential-based shaping
         dist_goal = self._network_distance_to_goal(self.vehicle.position, self.vehicle.lane_index)  #new
-        lane = self.road.network.get_lane(self.vehicle.lane_index)  #new
+        lane_idx, edge_d = self._closest_lane_index()  #new
+        dist_goal = self._network_distance_to_goal(self.vehicle.position, lane_idx)
+        lane = self.road.network.get_lane(lane_idx)  #new
         long, lat = lane.local_coordinates(self.vehicle.position)  #new
         w = lane.width_at(long)  #new
         lat_error = lat / (0.5 * w)  #new
@@ -348,7 +357,8 @@ class _BaseManhattanEnv(AbstractEnv):
         cfg = self.config
         # ---- compute geometric errors ---------------------------------
         dist_goal = self._network_distance_to_goal(self.vehicle.position, self.vehicle.lane_index)  #new
-        lane = self.road.network.get_lane(self.vehicle.lane_index)  #new
+        lane_idx, _ = self._closest_lane_index()  #new
+        lane = self.road.network.get_lane(lane_idx)
         long, lat = lane.local_coordinates(self.vehicle.position)  #new
         w = lane.width_at(long)  #new
         lat_error = lat / (0.5 * w)  #new
@@ -364,6 +374,7 @@ class _BaseManhattanEnv(AbstractEnv):
         r_safety = cfg["ttc_penalty_coef"] * max(0, 3 - self._front_ttc())  #new
         r_comfort = (cfg["jerk_cost"] * abs(self._last_jerk) +
                      cfg["steer_smoothness_coef"] * abs(action[1] - self._last_steer))  #new
+        self._last_steer = action[1]  #new
         r_terminal = cfg["goal_reward"] if self._goal_reached() else 0.0  #new
         r_terminal += cfg["crash_penalty"] if self.vehicle.crashed else 0.0  #new
         if self.off_road_hard:
