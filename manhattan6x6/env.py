@@ -19,9 +19,13 @@ new features (Aug-2025)
 * Two extra observations per step:
     1. **Heading-to-lane** (∆ψ) → provided as sine & cosine
     2. **Next-waypoint bearing** → sine & cosine to a look-ahead point 20 m ahead
-* Optional reward refactor: `heading_alignment` → `lane_heading`
+* Reward shaping now uses **heading to next waypoint** (turn-friendly)
+  instead of heading-to-lane.
+* **Intersection-aware off-road** check: in the last ~10 m of a lane, we
+  consider both the current lane and the best outgoing lane to avoid
+  spurious hard off-road flags while initiating a turn.
 * Observation length grows from `8 + N_RAYS` to `12 + N_RAYS`.
-* Lane aware TTC penalty
+* Lane-aware TTC penalty.
 """
 
 from __future__ import annotations
@@ -140,11 +144,11 @@ class GridObservation(ObservationType):
         w            = lane.width_at(long)
         off_centre   = np.clip(lat / (w / 2), -1.0, 1.0)
 
-        # Heading-to-lane
+        # Heading-to-lane (kept in observation)
         dpsi      = wrap_to_pi(v.heading - lane.heading_at(long))
         dpsi_obs  = np.array([np.sin(dpsi), np.cos(dpsi)])
 
-        # Next-waypoint bearing
+        # Next-waypoint bearing (used by policy + reward)
         wp_vec   = self.env._next_waypoint() - v.position
         wp_bear  = (np.arctan2(wp_vec[1], wp_vec[0]) - v.heading) % (2 * np.pi)
         wp_obs   = np.array([np.sin(wp_bear), np.cos(wp_bear)])
@@ -179,6 +183,7 @@ class GridObservation(ObservationType):
 # --------------------------------------------------------------------------- #
 # Base env helper                                                             #
 # --------------------------------------------------------------------------- #
+
 def _add_background_traffic(env, count: int):
     nodes     = list(env.road.network.graph)
     n_nodes   = len(nodes)
@@ -201,6 +206,43 @@ class _BaseManhattanEnv(AbstractEnv):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 15}
     GRID_SIZE: int
 
+    # -------------- safe lane edge-distance fallback -------------------- #
+    @staticmethod
+    def _lane_edge_distance(lane: StraightLane, position: np.ndarray) -> float:
+        """Return signed distance to lane edge.
+        Falls back to geometry if the lane class has no `edge_distance`.
+        Positive → inside; negative → outside.
+        """
+        if hasattr(lane, "edge_distance"):
+            return float(lane.edge_distance(position))
+        # Fallback using local coordinates
+        long, lat = lane.local_coordinates(position)
+        half_w = 0.5 * lane.width_at(long)
+        return float(half_w - abs(lat))
+
+    def _edge_distance_intersection_aware(self, lane_idx: LaneIndex, lookahead: float = 10.0) -> float:
+        """Union-of-lanes edge distance near intersections.
+        In the last `lookahead` meters, take the max edge-distance between the
+        current lane and the best outgoing lane (towards goal).
+        """
+        pos  = self.vehicle.position
+        lane = self.road.network.get_lane(lane_idx)
+        long, _ = lane.local_coordinates(pos)
+        d_curr = self._lane_edge_distance(lane, pos)
+        if long <= lane.length - lookahead:
+            return d_curr
+        # consider best outgoing lane close to the end of current lane
+        outs = self.road.network.outgoing_lanes(lane_idx)
+        if not outs:
+            return d_curr
+        best = min(
+            outs,
+            key=lambda idx: self._network_distance_to_goal(
+                self.road.network.get_lane(idx).position(0, 0), idx)
+        )
+        d_next = self._lane_edge_distance(self.road.network.get_lane(best), pos)
+        return max(d_curr, d_next)
+
     @classmethod
     def default_config(cls) -> Dict:
         cfg = super().default_config()
@@ -211,10 +253,10 @@ class _BaseManhattanEnv(AbstractEnv):
             lane_length=200.0,
             spawn_vehicles=20,
             # reward shaping using potential-based reward
-            alpha=1.0/200.0,  #new
-            beta=1.0,         #new
-            gamma=1.0,        #new
-            step_cost=-0.02,
+            alpha=5.0/200.0,
+            beta=1.0,
+            gamma=1.0,
+            step_cost=-0.01,
             jerk_cost=0.0,
             goal_reward=100.0,
             crash_penalty=-100.0,
@@ -251,7 +293,8 @@ class _BaseManhattanEnv(AbstractEnv):
     def _closest_lane_index(self, position=None, heading=None):
         pos = self.vehicle.position if position is None else position
         idx = self.road.network.get_closest_lane_index(pos, heading)
-        edge_d = self.road.network.get_lane(idx).edge_distance(pos)
+        # use robust edge-distance (with fallback)
+        edge_d = self._lane_edge_distance(self.road.network.get_lane(idx), pos)
         return idx, float(edge_d)
 
     def _front_ttc(self, horizon: float = 10.0) -> float:
@@ -268,7 +311,7 @@ class _BaseManhattanEnv(AbstractEnv):
         closing = max(ego_v - front_v, 1e-1)
         return float(np.clip(gap / closing, 0.0, horizon))
 
-    def _next_waypoint(self, lookahead: float = 20.0) -> np.ndarray:
+    def _next_waypoint(self, lookahead: float = 30.0) -> np.ndarray:
         """Position of a look-ahead point 20 m ahead (in next lane if upcoming exit)."""
         lane_idx, _ = self._closest_lane_index()
         lane = self.road.network.get_lane(lane_idx)
@@ -295,16 +338,19 @@ class _BaseManhattanEnv(AbstractEnv):
         return remaining_on_lane + edges_remaining * lane_len
     
     def off_road_update(self):
-        """Classify the ego position and return the penaty
+        """Classify the ego position and return the penalty
         (0 if still on lane). Also updates the flags + episode stats.
+        Intersection-aware near corners so turns aren't spuriously flagged.
         """
-
         cfg = self.config
-        lane_idx, edge_d = self._closest_lane_index()
+        # closest *current* lane index
+        lane_idx, _ = self._closest_lane_index()
         self.vehicle.lane_index = lane_idx  # update lane index in the vehicle
 
-        on_lane = edge_d >= 0.0
-        if on_lane:
+        # union-of-lanes edge distance near intersection
+        edge_d = self._edge_distance_intersection_aware(lane_idx, lookahead=10.0)
+
+        if edge_d >= 0.0:
             self.off_road_hard = self.off_road_soft = False
             return 0.0
         if edge_d >= cfg["soft_offroad_margin"]:
@@ -319,33 +365,36 @@ class _BaseManhattanEnv(AbstractEnv):
         self._create_vehicles(self.config)
         self._last_speed = self._last_acc = self._last_jerk = self._last_steer = 0.0
         self.off_road_hard = self.off_road_soft = False
-        # initialize potential-based shaping
-        dist_goal = self._network_distance_to_goal(self.vehicle.position, self.vehicle.lane_index)  #new
-        lane_idx, edge_d = self._closest_lane_index()  #new
+        # initialize potential-based shaping (turn-friendly)
+        lane_idx, _ = self._closest_lane_index()
+        lane = self.road.network.get_lane(lane_idx)
+        long, lat = lane.local_coordinates(self.vehicle.position)
+        w = lane.width_at(long)
+        lat_error = lat / (0.5 * w)
         dist_goal = self._network_distance_to_goal(self.vehicle.position, lane_idx)
-        lane = self.road.network.get_lane(lane_idx)  #new
-        long, lat = lane.local_coordinates(self.vehicle.position)  #new
-        w = lane.width_at(long)  #new
-        lat_error = lat / (0.5 * w)  #new
-        heading_error = wrap_to_pi(self.vehicle.heading - lane.heading_at(long))  #new
-        self._phi_prev = self.config["alpha"] * dist_goal + self.config["beta"] * abs(lat_error) + self.config["gamma"] * abs(heading_error)  #new
+        wp = self._next_waypoint()
+        desired_heading = np.arctan2((wp - self.vehicle.position)[1], (wp - self.vehicle.position)[0])
+        heading_error = wrap_to_pi(self.vehicle.heading - desired_heading)
+        self._phi_prev = (
+            self.config["alpha"] * dist_goal +
+            self.config["beta"]  * abs(lat_error) +
+            self.config["gamma"] * abs(heading_error)
+        )
         self._ep_stats = {
             "total_reward": 0.0,
-            "shape": 0.0,  #new
+            "shape": 0.0,
             "ttc": 0.0,
             "step_cost": 0.0,
             "jerk": 0.0,
             "crash": 0.0,
             "goal": 0.0,
-            "off_road_hard_event": 0,  #new
-            "off_road_soft_penalty": 0.0,  #new
+            "off_road_hard_event": 0,
+            "off_road_soft_penalty": 0.0,
+            "dist0" : float(dist_goal),
+            "dist" : float(dist_goal),
+            "dist_min" : float(dist_goal),
         }
         self.steps = 0
-
-    def reset(self, **kwargs) :
-        obs, info = super().reset(**kwargs)
-        self._reset()
-        return obs, info
     
     def step(self, action):
         """One simulatior tick with counters, rewards and termination checks."""
@@ -356,41 +405,51 @@ class _BaseManhattanEnv(AbstractEnv):
     def _reward(self, action) -> float:
         cfg = self.config
         # ---- compute geometric errors ---------------------------------
-        dist_goal = self._network_distance_to_goal(self.vehicle.position, self.vehicle.lane_index)  #new
-        lane_idx, _ = self._closest_lane_index()  #new
+        lane_idx, _ = self._closest_lane_index()
         lane = self.road.network.get_lane(lane_idx)
-        long, lat = lane.local_coordinates(self.vehicle.position)  #new
-        w = lane.width_at(long)  #new
-        lat_error = lat / (0.5 * w)  #new
-        desired_heading = lane.heading_at(long)  #new
-        heading_error = wrap_to_pi(self.vehicle.heading - desired_heading)  #new
+        long, lat = lane.local_coordinates(self.vehicle.position)
+        w = lane.width_at(long)
+        lat_error = lat / (0.5 * w)
+        dist_goal = self._network_distance_to_goal(self.vehicle.position, lane_idx)
+        # turn-friendly heading target: next waypoint, not lane heading
+        wp = self._next_waypoint()
+        desired_heading = np.arctan2((wp - self.vehicle.position)[1], (wp - self.vehicle.position)[0])
+        heading_error = wrap_to_pi(self.vehicle.heading - desired_heading)
+
+        # ---- turn boost -----------------------------------------------
+        remaining = max(lane.length - long, 0.0)
+        turn_boost = 1.0 + 2.0 * np.exp(-(remaining / 12.0) ** 2)
         # ---- potential-based shaping ----------------------------------
-        phi_now = cfg["alpha"] * dist_goal + cfg["beta"] * abs(lat_error) + cfg["gamma"] * abs(heading_error)  #new
-        r_shape = self._phi_prev - phi_now  #new
-        self._phi_prev = phi_now  #new
+        phi_now = cfg["alpha"] * dist_goal + cfg["beta"] * abs(lat_error) + (cfg["gamma"] * turn_boost) * abs(heading_error)
+        r_shape = self._phi_prev - phi_now
+        self._phi_prev = phi_now
         # ---- off road handling ----------------------------------------
-        r_off = self.off_road_update()  #new
+        r_off = self.off_road_update()
         # ---- safety / comfort / sparse terms --------------------------
-        r_safety = cfg["ttc_penalty_coef"] * max(0, 3 - self._front_ttc())  #new
+        r_safety = cfg["ttc_penalty_coef"] * max(0, 3 - self._front_ttc())
         r_comfort = (cfg["jerk_cost"] * abs(self._last_jerk) +
-                     cfg["steer_smoothness_coef"] * abs(action[1] - self._last_steer))  #new
-        self._last_steer = action[1]  #new
-        r_terminal = cfg["goal_reward"] if self._goal_reached() else 0.0  #new
-        r_terminal += cfg["crash_penalty"] if self.vehicle.crashed else 0.0  #new
+                     cfg["steer_smoothness_coef"] * abs(action[1] - self._last_steer))
+        self._last_steer = action[1]
+        r_terminal = cfg["goal_reward"] if self._goal_reached() else 0.0
+        r_terminal += cfg["crash_penalty"] if self.vehicle.crashed else 0.0
         if self.off_road_hard:
-            self._ep_stats["off_road_hard_event"] += 1  #new
+            self._ep_stats["off_road_hard_event"] += 1
         if self.off_road_soft:
-            self._ep_stats["off_road_soft_penalty"] += r_off  #new
+            self._ep_stats["off_road_soft_penalty"] += r_off
+        # ---- step cost
+        r_step = cfg["step_cost"]
         # ---- aggregate -----------------------------------------------
-        r = r_shape - r_safety - r_comfort + r_terminal + r_off  #new
-        self._ep_stats["shape"] += r_shape  #new
-        self._ep_stats["ttc"] += -r_safety  #new
-        self._ep_stats["jerk"] += cfg["jerk_cost"] * abs(self._last_jerk)  #new
-        self._ep_stats["step_cost"] += 0.0  #new
-        self._ep_stats["crash"] += cfg["crash_penalty"] if self.vehicle.crashed else 0.0  #new
-        self._ep_stats["goal"] += cfg["goal_reward"] if self._goal_reached() else 0.0  #new
-        self._ep_stats["total_reward"] += r  #new
-        return float(r)  #new
+        r = r_shape - r_safety - r_comfort + r_terminal + r_off + r_step
+        self._ep_stats["shape"] += r_shape
+        self._ep_stats["ttc"] += -r_safety
+        self._ep_stats["jerk"] += cfg["jerk_cost"] * abs(self._last_jerk)
+        self._ep_stats["step_cost"] += r_step
+        self._ep_stats["crash"] += cfg["crash_penalty"] if self.vehicle.crashed else 0.0
+        self._ep_stats["goal"] += cfg["goal_reward"] if self._goal_reached() else 0.0
+        self._ep_stats["total_reward"] += r
+        self._ep_stats["dist"] = float(dist_goal)
+        self._ep_stats["dist_min"] = float(min(self._ep_stats["dist_min"], dist_goal))
+        return float(r)
 
     def _info(self, obs, action):
         if self._is_terminated() or self._is_truncated():

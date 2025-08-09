@@ -348,13 +348,14 @@ def make_env() -> gym.Env:
 
 def make_vec_env(log_path: Path) -> VecNormalize:
     raw_env = DummyVecEnv([make_env])
-    venv = VecNormalize(raw_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    venv = VecNormalize(raw_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
     venv = VecMonitor(
         venv,
         filename=str(log_path / "monitor.csv"),
         info_keywords=(
             "total_reward", "shape", "ttc", "step_cost", "jerk",
             "crash", "goal", "off_road_hard_event", "off_road_soft_penalty",
+            "dist0", "dist", "dist_min",
         ),
     )
     return venv
